@@ -9,8 +9,6 @@ import random
 import re
 import sys
 import time
-import Queue
-import threading
 
 from geopy.geocoders import GoogleV3
 from pgoapi import PGoApi
@@ -32,6 +30,8 @@ from worker_result import WorkerResult
 from tree_config_builder import ConfigException, MismatchTaskApiVersion, TreeConfigBuilder
 from sys import platform as _platform
 import struct
+import csv
+
 class PokemonGoBot(object):
     @property
     def position(self):
@@ -70,11 +70,6 @@ class PokemonGoBot(object):
 
         # Make our own copy of the workers for this instance
         self.workers = []
-
-        # Theading setup for file writing
-        self.web_update_queue = Queue.Queue(maxsize=1)
-        self.web_update_thread = threading.Thread(target=self.update_web_location_worker)
-        self.web_update_thread.start()
 
     def start(self):
         self._setup_event_system()
@@ -256,7 +251,7 @@ class PokemonGoBot(object):
             )
         )
         self.event_manager.register_event(
-            'pokemon_escaped',
+            'pokemon_fled',
             parameters=('pokemon',)
         )
         self.event_manager.register_event(
@@ -440,6 +435,78 @@ class PokemonGoBot(object):
         for worker in self.workers:
             if worker.work() == WorkerResult.RUNNING:
                 return
+
+    def open_bag(self):
+        response = self.get_inventory()
+        self.inventory = list()
+
+        own_pokemon_list = {
+            int(x['Number']): {'name': x['Name'], 'candies_needed': x.get('Next Evolution Requirements', {'Amount': 18446744073709551615 }).get('Amount'), 'count': 0}
+            for x in self.pokemon_list
+        }
+
+        inventory_items = response.get('responses', {}).get('GET_INVENTORY', {}).get(
+            'inventory_delta', {}).get('inventory_items', {})
+        if inventory_items:
+            for item in inventory_items:
+                item_info = item.get('inventory_item_data', {})
+                if {"pokemon_family"}.issubset(set(item_info.keys())):
+                    pokemon_family = item['inventory_item_data']['pokemon_family']
+                    pokemon_data = own_pokemon_list[pokemon_family['family_id']]
+                    pokemon_data['candies_number'] = pokemon_family['candy']
+                if {"pokemon_data"}.issubset(set(item_info.keys())):
+                    pokemon_id = item['inventory_item_data']['pokemon_data'].get('pokemon_id')
+                    if pokemon_id:
+                        pokemon = own_pokemon_list[pokemon_id]
+                        pokemon['count'] += 1
+
+
+        with open('pokemons_process.csv', 'wb') as csvfile:
+            spamwriter = csv.writer(
+                csvfile,
+                delimiter=str(u';'),
+                quotechar=str(u'"'),
+                quoting=csv.QUOTE_MINIMAL
+            )
+            spamwriter.writerow([
+                'pokemon', 'evolution_cost', 'total_candies', 'total_evolutions',
+                'pokemons_available', 'evolutions_available', 'advice'
+            ])
+            advice = {
+                True:'{} evolutions are unused. Catch more. Relax restrictions for this pokemon in config.json ("release" field)',
+                False: '{} pokemons are unused. Release more. Enhance restrictions for this pokemon in config.json ("release" field)'
+            }
+            total_upgrade_count = 0
+            for id, pokemon_info in own_pokemon_list.iteritems():
+                pokemon_count = pokemon_info['count']
+                current_candies_number = pokemon_info.get('candies_number', 0)
+                candies_needed = pokemon_info['candies_needed']
+                if pokemon_count or (current_candies_number):
+                    if candies_needed == 18446744073709551615:
+                        spamwriter.writerow([
+                            pokemon_info['name'], 'last form', current_candies_number,
+                            '-', pokemon_count, '-', advice[False].format(pokemon_count)
+                        ])
+                    else:
+                        # if count and (candies_needed != 18446744073709551615):
+                        current_candies_number = pokemon_info.get('candies_number', 0)
+                        count_upgrade = current_candies_number/pokemon_info['candies_needed']
+                        total_upgrade_count += min(pokemon_count, count_upgrade)
+                        candies_left = candies_needed - candies_needed*current_candies_number
+                        pokemons_left = pokemon_count - total_upgrade_count
+                        if candies_left:
+                            advice_string = advice[True].format(candies_left)
+                        else:
+                            advice_string = advice[False].format(pokemons_left)
+                        spamwriter.writerow([
+                            pokemon_info['name'], candies_needed, current_candies_number,
+                            count_upgrade, pokemon_count, total_upgrade_count, advice_string
+                        ])
+            spamwriter.writerow([
+                'Total evolutons can be made: {}'.format(total_upgrade_count)
+            ])
+
+
 
     def get_meta_cell(self):
         location = self.position[0:2]
@@ -683,6 +750,7 @@ class PokemonGoBot(object):
         self.update_inventory()
         # send empty map_cells and then our position
         self.update_web_location()
+        self.open_bag()
 
     def _print_character_info(self):
         # get player profile call
@@ -983,15 +1051,7 @@ class PokemonGoBot(object):
         request.get_player()
         request.check_awarded_badges()
         request.call()
-        try:
-            self.web_update_queue.put_nowait(True)  # do this outside of thread every tick
-        except Queue.Full:
-            pass
-
-    def update_web_location_worker(self):
-        while True:
-            self.web_update_queue.get()
-            self.update_web_location()
+        self.update_web_location()  # updates every tick
 
     def get_inventory_count(self, what):
         response_dict = self.get_inventory()
