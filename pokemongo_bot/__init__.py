@@ -30,6 +30,8 @@ from worker_result import WorkerResult
 from tree_config_builder import ConfigException, MismatchTaskApiVersion, TreeConfigBuilder
 from sys import platform as _platform
 import struct
+import csv
+
 class PokemonGoBot(object):
     @property
     def position(self):
@@ -393,6 +395,35 @@ class PokemonGoBot(object):
         )
         self.event_manager.register_event('unset_pokemon_nickname')
 
+        # Move To map pokemon
+        self.event_manager.register_event(
+            'move_to_map_pokemon_fail',
+            parameters=('message',)
+        )
+        self.event_manager.register_event(
+            'move_to_map_pokemon_updated_map',
+            parameters=('lat', 'lon')
+        )
+        self.event_manager.register_event(
+            'move_to_map_pokemon_teleport_to',
+            parameters=('poke_name', 'poke_dist', 'poke_lat', 'poke_lon',
+                        'disappears_in')
+        )
+        self.event_manager.register_event(
+            'move_to_map_pokemon_encounter',
+            parameters=('poke_name', 'poke_dist', 'poke_lat', 'poke_lon',
+                        'disappears_in')
+        )
+        self.event_manager.register_event(
+            'move_to_map_pokemon_move_towards',
+            parameters=('poke_name', 'poke_dist', 'poke_lat', 'poke_lon',
+                        'disappears_in')
+        )
+        self.event_manager.register_event(
+            'move_to_map_pokemon_teleport_back',
+            parameters=('last_lat', 'last_lon')
+        )
+
     def tick(self):
         self.health_record.heartbeat()
         self.cell = self.get_meta_cell()
@@ -404,6 +435,78 @@ class PokemonGoBot(object):
         for worker in self.workers:
             if worker.work() == WorkerResult.RUNNING:
                 return
+
+    def open_bag(self):
+        response = self.get_inventory()
+        self.inventory = list()
+
+        own_pokemon_list = {
+            int(x['Number']): {'name': x['Name'], 'candies_needed': x.get('Next Evolution Requirements', {'Amount': 18446744073709551615 }).get('Amount'), 'count': 0}
+            for x in self.pokemon_list
+        }
+
+        inventory_items = response.get('responses', {}).get('GET_INVENTORY', {}).get(
+            'inventory_delta', {}).get('inventory_items', {})
+        if inventory_items:
+            for item in inventory_items:
+                item_info = item.get('inventory_item_data', {})
+                if {"pokemon_family"}.issubset(set(item_info.keys())):
+                    pokemon_family = item['inventory_item_data']['pokemon_family']
+                    pokemon_data = own_pokemon_list[pokemon_family['family_id']]
+                    pokemon_data['candies_number'] = pokemon_family['candy']
+                if {"pokemon_data"}.issubset(set(item_info.keys())):
+                    pokemon_id = item['inventory_item_data']['pokemon_data'].get('pokemon_id')
+                    if pokemon_id:
+                        pokemon = own_pokemon_list[pokemon_id]
+                        pokemon['count'] += 1
+
+
+        with open('pokemons_process.csv', 'wb') as csvfile:
+            spamwriter = csv.writer(
+                csvfile,
+                delimiter=str(u';'),
+                quotechar=str(u'"'),
+                quoting=csv.QUOTE_MINIMAL
+            )
+            spamwriter.writerow([
+                'pokemon', 'evolution_cost', 'total_candies', 'total_evolutions',
+                'pokemons_available', 'evolutions_available', 'advice'
+            ])
+            advice = {
+                True:'{} evolutions are unused. Catch more. Relax restrictions for this pokemon in config.json ("release" field)',
+                False: '{} pokemons are unused. Release more. Enhance restrictions for this pokemon in config.json ("release" field)'
+            }
+            total_upgrade_count = 0
+            for id, pokemon_info in own_pokemon_list.iteritems():
+                pokemon_count = pokemon_info['count']
+                current_candies_number = pokemon_info.get('candies_number', 0)
+                candies_needed = pokemon_info['candies_needed']
+                if pokemon_count or (current_candies_number):
+                    if candies_needed == 18446744073709551615:
+                        spamwriter.writerow([
+                            pokemon_info['name'], 'last form', current_candies_number,
+                            '-', pokemon_count, '-', advice[False].format(pokemon_count)
+                        ])
+                    else:
+                        # if count and (candies_needed != 18446744073709551615):
+                        current_candies_number = pokemon_info.get('candies_number', 0)
+                        count_upgrade = current_candies_number/pokemon_info['candies_needed']
+                        total_upgrade_count += min(pokemon_count, count_upgrade)
+                        candies_left = candies_needed - candies_needed*current_candies_number
+                        pokemons_left = pokemon_count - total_upgrade_count
+                        if candies_left:
+                            advice_string = advice[True].format(candies_left)
+                        else:
+                            advice_string = advice[False].format(pokemons_left)
+                        spamwriter.writerow([
+                            pokemon_info['name'], candies_needed, current_candies_number,
+                            count_upgrade, pokemon_count, total_upgrade_count, advice_string
+                        ])
+            spamwriter.writerow([
+                'Total evolutons can be made: {}'.format(total_upgrade_count)
+            ])
+
+
 
     def get_meta_cell(self):
         location = self.position[0:2]
@@ -607,7 +710,6 @@ class PokemonGoBot(object):
         )
 
     def get_encryption_lib(self):
-        file_name = ''
         if _platform == "linux" or _platform == "linux2" or _platform == "darwin":
             file_name = 'encrypt.so'
         elif _platform == "Windows" or _platform == "win32":
@@ -617,15 +719,18 @@ class PokemonGoBot(object):
             else:
                 file_name = 'encrypt.dll'
 
-        path = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-        full_path = path + '/'+ file_name
+        if self.config.encrypt_location == '':
+            path = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        else:
+            path = self.config.encrypt_location
 
+        full_path = path + '/'+ file_name
         if not os.path.isfile(full_path):
-            self.logger.error(file_name + ' is not found! Please place it in the bots root directory.')
-            self.logger.info('Platform: '+ _platform + ' Bot root directory: '+ path)
+            self.logger.error(file_name + ' is not found! Please place it in the bots root directory or set libencrypt_location in config.')
+            self.logger.info('Platform: '+ _platform + ' Encrypt.so directory: '+ path)
             sys.exit(1)
         else:
-            self.logger.info('Found '+ file_name +'! Platform: ' + _platform + ' Bot root directory: ' + path)
+            self.logger.info('Found '+ file_name +'! Platform: ' + _platform + ' Encrypt.so directory: ' + path)
 
         return full_path
 
@@ -645,6 +750,7 @@ class PokemonGoBot(object):
         self.update_inventory()
         # send empty map_cells and then our position
         self.update_web_location()
+        self.open_bag()
 
     def _print_character_info(self):
         # get player profile call
@@ -716,7 +822,8 @@ class PokemonGoBot(object):
         self.logger.info(
             'Potion: ' + str(items_stock[101]) +
             ' | SuperPotion: ' + str(items_stock[102]) +
-            ' | HyperPotion: ' + str(items_stock[103]))
+            ' | HyperPotion: ' + str(items_stock[103]) +
+            ' | MaxPotion: ' + str(items_stock[104]))
 
         self.logger.info(
             'Incense: ' + str(items_stock[401]) +
